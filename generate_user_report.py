@@ -932,17 +932,17 @@ html = f"""<!DOCTYPE html>
   <div class="hero-grid">
     <div class="hero-card">
       <div class="hero-val">{q1_total}</div>
-      <div class="hero-label">Activated Users</div>
+      <div class="hero-label">Users Activated</div>
       <div class="hero-sub">Completed onboarding</div>
     </div>
     <div class="hero-card">
       <div class="hero-val {q2_val_class}">{len(q2_zero)}</div>
-      <div class="hero-label">Zero Sleep Sessions</div>
+      <div class="hero-label">Users with Zero Sleep Sessions (&gt;90m)</div>
       <div class="hero-sub">{len(q2_zero)*100//q1_total if q1_total else 0}% of cohort</div>
     </div>
     <div class="hero-card">
       <div class="hero-val {q3_val_class}">{len(q3_high_usage)}</div>
-      <div class="hero-label">&gt;50% Eligible Nights</div>
+      <div class="hero-label">Users Who Slept with Buds &gt;50% Eligible Nights</div>
       <div class="hero-sub">{len(q3_high_usage)*100//q1_total if q1_total else 0}% of cohort</div>
     </div>
     <div class="hero-card">
