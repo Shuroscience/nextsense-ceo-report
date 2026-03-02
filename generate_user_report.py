@@ -416,6 +416,186 @@ for evt in healthkit_events:
 
 print(f"\n  Q7 - Users with HealthKit sync: {len(healthkit_users)}/{q1_total}")
 
+# ── Step 5b: Lifecycle categories ─────────────────────────────────────
+print("\n  Computing lifecycle categories...")
+
+CATEGORY_DISPLAY = [
+    ("highly_active", "Highly Active", "#00C2A8"),
+    ("active",        "Active",        "#71D688"),
+    ("resurrected",   "Resurrected",   "#B26CDD"),
+    ("at_risk",       "At-Risk",       "#D84516"),
+    ("churned",       "Churned",       "#8B5E3C"),
+    ("never_active",  "Never Active",  "#949494"),
+]
+
+def get_session_dates(uid):
+    """Return sorted list of unique date objects for a user's qualifying sessions."""
+    dates = set()
+    for s in user_sessions.get(uid, []):
+        try:
+            dates.add(datetime.fromisoformat(s["date"]).date())
+        except Exception:
+            pass
+    return sorted(dates)
+
+LIFECYCLE = {}  # uid -> category key
+
+for uid in activated_users:
+    session_dates = get_session_dates(uid)
+
+    if not session_dates:
+        LIFECYCLE[uid] = "never_active"
+        continue
+
+    has_recent = any(d >= TODAY - timedelta(days=7) for d in session_dates)
+
+    # Check for resurrection: was there ever a gap >15 days?
+    gap_points = [activation_dates[uid]] + session_dates
+    had_churn_gap = False
+    for i in range(1, len(gap_points)):
+        if (gap_points[i] - gap_points[i - 1]).days > 15:
+            had_churn_gap = True
+            break
+
+    if had_churn_gap and has_recent:
+        LIFECYCLE[uid] = "resurrected"
+        continue
+
+    # Highly Active: avg 4+ sessions/week over rolling 4-week window
+    four_weeks_ago = TODAY - timedelta(days=28)
+    recent_4w = [d for d in session_dates if d >= four_weeks_ago]
+    weeks_active = min(4.0, max(1.0, (TODAY - max(activation_dates[uid], four_weeks_ago)).days / 7.0))
+    if len(recent_4w) / weeks_active >= 4:
+        LIFECYCLE[uid] = "highly_active"
+        continue
+
+    if has_recent:
+        LIFECYCLE[uid] = "active"
+        continue
+
+    last_session = session_dates[-1]
+    days_since_last = (TODAY - last_session).days
+
+    if 8 <= days_since_last <= 15:
+        LIFECYCLE[uid] = "at_risk"
+        continue
+
+    if days_since_last > 15:
+        LIFECYCLE[uid] = "churned"
+        continue
+
+    # Fallback (session 1-7 days ago, didn't match above)
+    LIFECYCLE[uid] = "active"
+
+category_counts = {key: 0 for key, _, _ in CATEGORY_DISPLAY}
+for uid, cat in LIFECYCLE.items():
+    category_counts[cat] += 1
+
+for key, label, _ in CATEGORY_DISPLAY:
+    print(f"    {label}: {category_counts[key]}")
+
+# Build SVG donut chart
+import math
+total_users = sum(category_counts.values())
+radius = 80
+circumference = 2 * math.pi * radius
+stroke_width = 32
+cx, cy = 120, 120
+
+segments_svg = ""
+offset = 0
+for key, label, color in CATEGORY_DISPLAY:
+    count = category_counts[key]
+    if count == 0:
+        continue
+    pct = count / total_users
+    dash = circumference * pct
+    gap = circumference - dash
+    segments_svg += (
+        f'<circle cx="{cx}" cy="{cy}" r="{radius}" '
+        f'fill="none" stroke="{color}" stroke-width="{stroke_width}" '
+        f'stroke-dasharray="{dash:.2f} {gap:.2f}" '
+        f'stroke-dashoffset="{-offset:.2f}" '
+        f'transform="rotate(-90 {cx} {cy})" />'
+    )
+    offset += dash
+
+donut_svg = (
+    f'<svg width="240" height="240" viewBox="0 0 240 240">'
+    f'{segments_svg}'
+    f'<text x="{cx}" y="{cy - 8}" text-anchor="middle" fill="#2A2B3F" '
+    f'font-size="36" font-weight="300" font-family="DM Sans, sans-serif">{total_users}</text>'
+    f'<text x="{cx}" y="{cy + 14}" text-anchor="middle" fill="#999" '
+    f'font-size="12" font-family="DM Sans, sans-serif">USERS</text>'
+    f'</svg>'
+)
+
+legend_html = ""
+for key, label, color in CATEGORY_DISPLAY:
+    count = category_counts[key]
+    pct = round(count * 100 / total_users) if total_users else 0
+    legend_html += (
+        f'<div style="display:flex;align-items:center;gap:10px;padding:6px 0;">'
+        f'<span style="width:12px;height:12px;border-radius:50%;background:{color};flex-shrink:0;"></span>'
+        f'<span style="font-size:14px;flex:1;color:#2A2B3F;">{label}</span>'
+        f'<span style="font-size:14px;font-weight:600;color:#2A2B3F;font-variant-numeric:tabular-nums;">{count}</span>'
+        f'<span style="font-size:13px;color:#888;width:40px;text-align:right;font-variant-numeric:tabular-nums;">{pct}%</span>'
+        f'</div>'
+    )
+
+# Build lifecycle-aware Q5 breakdown
+churned_users = sorted(
+    [uid for uid, cat in LIFECYCLE.items() if cat == "churned"],
+    key=lambda u: profile_lookup.get(u, {}).get("name", "Unknown")
+)
+at_risk_users = sorted(
+    [uid for uid, cat in LIFECYCLE.items() if cat == "at_risk"],
+    key=lambda u: profile_lookup.get(u, {}).get("name", "Unknown")
+)
+resurrected_users = sorted(
+    [uid for uid, cat in LIFECYCLE.items() if cat == "resurrected"],
+    key=lambda u: profile_lookup.get(u, {}).get("name", "Unknown")
+)
+
+def _last_session_days(uid):
+    dates = get_session_dates(uid)
+    if dates:
+        return (TODAY - dates[-1]).days
+    return 999
+
+churned_rows = ""
+for uid in sorted(churned_users, key=lambda u: -_last_session_days(u)):
+    name = profile_lookup.get(uid, {}).get("name", "Unknown")
+    days = _last_session_days(uid)
+    last_seen = profile_lookup.get(uid, {}).get("$last_seen", "")[:10]
+    churned_rows += f"<tr><td>{name}</td><td>{last_seen}</td><td>{days} days</td></tr>"
+
+at_risk_rows = ""
+for uid in sorted(at_risk_users, key=lambda u: -_last_session_days(u)):
+    name = profile_lookup.get(uid, {}).get("name", "Unknown")
+    days = _last_session_days(uid)
+    last_seen = profile_lookup.get(uid, {}).get("$last_seen", "")[:10]
+    at_risk_rows += f"<tr><td>{name}</td><td>{last_seen}</td><td>{days} days</td></tr>"
+
+resurrected_rows = ""
+for uid in resurrected_users:
+    name = profile_lookup.get(uid, {}).get("name", "Unknown")
+    dates = get_session_dates(uid)
+    last_session = dates[-1].strftime("%b %d") if dates else "—"
+    resurrected_rows += f"<tr><td>{name}</td><td>{last_session}</td></tr>"
+
+q5_churned_detail = ""
+if churned_users:
+    q5_churned_detail = "<details><summary>See " + str(len(churned_users)) + " churned users</summary><div class='detail-content'><div class='table-wrap'><table><thead><tr><th>User</th><th>Last Seen</th><th>Days Since Last Session</th></tr></thead><tbody>" + churned_rows + "</tbody></table></div></div></details>"
+
+q5_at_risk_detail = ""
+if at_risk_users:
+    q5_at_risk_detail = "<details><summary>See " + str(len(at_risk_users)) + " at-risk users</summary><div class='detail-content'><div class='table-wrap'><table><thead><tr><th>User</th><th>Last Seen</th><th>Days Since Last Session</th></tr></thead><tbody>" + at_risk_rows + "</tbody></table></div></div></details>"
+
+q5_resurrected_detail = ""
+if resurrected_users:
+    q5_resurrected_detail = "<details><summary>See " + str(len(resurrected_users)) + " resurrected users</summary><div class='detail-content'><div class='table-wrap'><table><thead><tr><th>User</th><th>Last Session</th></tr></thead><tbody>" + resurrected_rows + "</tbody></table></div></div></details>"
+
 
 # ── Step 6: Generate HTML report ────────────────────────────────────────
 print("\n" + "=" * 60)
@@ -457,15 +637,16 @@ for uid in sorted(activated_users, key=lambda u: activation_dates[u]):
 
     has_hk = "Yes" if uid in healthkit_users else "No"
 
-    # Status
-    if uid in [c["uid"] for c in q5_churn]:
-        status = '<span style="color:#D84516;font-weight:600">Potential churn</span>'
-    elif n_sessions == 0:
-        status = '<span style="color:#D84516">No sessions</span>'
-    elif rate >= 50:
-        status = '<span style="color:#71D688;font-weight:600">Active</span>'
-    else:
-        status = '<span style="color:#FFC28A">Low usage</span>'
+    # Lifecycle status
+    _status_map = {
+        "highly_active": '<span style="color:#00C2A8;font-weight:600">Highly Active</span>',
+        "active":        '<span style="color:#71D688;font-weight:600">Active</span>',
+        "resurrected":   '<span style="color:#B26CDD;font-weight:600">Resurrected</span>',
+        "at_risk":       '<span style="color:#D84516;font-weight:600">At-Risk</span>',
+        "churned":       '<span style="color:#8B5E3C;font-weight:600">Churned</span>',
+        "never_active":  '<span style="color:#949494;font-weight:600">Never Active</span>',
+    }
+    status = _status_map.get(LIFECYCLE.get(uid, ""), '<span style="color:#949494">Unknown</span>')
 
     user_rows_html += f"""<tr>
         <td>{name}</td>
@@ -497,7 +678,8 @@ BRAND_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIIAAABMCAYAAACh4W85
 # Warn/good color classes
 q2_val_class = "val-red" if len(q2_zero) > q1_total * 0.3 else ("val-yellow" if len(q2_zero) > q1_total * 0.15 else "val-green")
 q3_val_class = "val-green" if len(q3_high_usage) > q1_total * 0.4 else ("val-yellow" if len(q3_high_usage) > q1_total * 0.2 else "val-red")
-q5_val_class = "val-green" if len(q5_churn) < q1_total * 0.05 else ("val-yellow" if len(q5_churn) < q1_total * 0.15 else "val-red")
+q5_risk_total = category_counts["at_risk"] + category_counts["churned"]
+q5_val_class = "val-green" if q5_risk_total < q1_total * 0.05 else ("val-yellow" if q5_risk_total < q1_total * 0.15 else "val-red")
 
 # Pre-build detail HTML strings (avoids nested f-string escaping issues)
 q2_detail_html = ""
@@ -946,9 +1128,9 @@ html = f"""<!DOCTYPE html>
       <div class="hero-sub">{len(q3_high_usage)*100//q1_total if q1_total else 0}% of cohort</div>
     </div>
     <div class="hero-card">
-      <div class="hero-val {q5_val_class}">{len(q5_churn)}</div>
-      <div class="hero-label">Potential Churn</div>
-      <div class="hero-sub">&gt;14 days inactive</div>
+      <div class="hero-val {q5_val_class}">{q5_risk_total}</div>
+      <div class="hero-label">At-Risk + Churned</div>
+      <div class="hero-sub">{category_counts["at_risk"]} at-risk &middot; {category_counts["churned"]} churned</div>
     </div>
   </div>
 </div>
@@ -967,11 +1149,31 @@ html = f"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ──────────── LIFECYCLE DISTRIBUTION ──────────── -->
+<div class="section-card visible">
+  <h2>User Lifecycle Distribution</h2>
+  <p>Current status of all <strong>{total_users} activated users</strong> based on sleep session activity.</p>
+  <div style="display:flex;align-items:center;gap:40px;flex-wrap:wrap;margin:24px 0;">
+    <div>{donut_svg}</div>
+    <div style="flex:1;min-width:220px;">{legend_html}</div>
+  </div>
+  <div class="method-note">
+    <strong>Category definitions:</strong><br>
+    <strong style="color:#00C2A8">Highly Active</strong> = avg 4+ sessions/week (rolling 4 weeks) &middot;
+    <strong style="color:#71D688">Active</strong> = &ge;1 session in last 7 days &middot;
+    <strong style="color:#B26CDD">Resurrected</strong> = returned after &gt;15 day gap &middot;
+    <strong style="color:#D84516">At-Risk</strong> = 8&ndash;15 days since last session &middot;
+    <strong style="color:#8B5E3C">Churned</strong> = &gt;15 days since last session &middot;
+    <strong style="color:#949494">Never Active</strong> = onboarded but zero sessions.
+  </div>
+</div>
+
 <!-- ──────────── Q2 ──────────── -->
 <div class="section-card visible">
   <h2>Q2: How many have zero nights of sleep?</h2>
   <p>
-    <strong>{len(q2_zero)} of {q1_total} users ({len(q2_zero)*100//q1_total if q1_total else 0}%)</strong> have not logged a single qualifying sleep session (&gt;90 min).
+    <strong>{len(q2_zero)} of {q1_total} users ({len(q2_zero)*100//q1_total if q1_total else 0}%)</strong> completed onboarding but have not logged a single qualifying sleep session (&gt;90 min).
+    These users are classified as <strong style="color:#949494">&ldquo;Never Active.&rdquo;</strong>
   </p>
   {q2_detail_html}
   <div class="method-note">
@@ -1024,16 +1226,37 @@ html = f"""<!DOCTYPE html>
 
 <!-- ──────────── Q5 ──────────── -->
 <div class="section-card visible">
-  <h2>Q5: Who has potentially churned?</h2>
-  <p>
-    <strong>{len(q5_churn)} of {q1_total} users ({len(q5_churn)*100//q1_total if q1_total else 0}%)</strong> show no Mixpanel activity for &gt;14 days.
-  </p>
-  {q5_detail_html}
+  <h2>Q5: Engagement Risk &amp; Recovery</h2>
+
+  <div class="stat-grid" style="grid-template-columns: repeat(3, 1fr);">
+    <div class="stat-card" style="border-left:4px solid #D84516;">
+      <div class="stat-label">At-Risk</div>
+      <div class="stat-main" style="color:#D84516;">{category_counts["at_risk"]}</div>
+      <div class="stat-detail">8&ndash;15 days since last session</div>
+    </div>
+    <div class="stat-card" style="border-left:4px solid #8B5E3C;">
+      <div class="stat-label">Churned</div>
+      <div class="stat-main" style="color:#8B5E3C;">{category_counts["churned"]}</div>
+      <div class="stat-detail">&gt;15 days since last session</div>
+    </div>
+    <div class="stat-card" style="border-left:4px solid #B26CDD;">
+      <div class="stat-label">Resurrected</div>
+      <div class="stat-main" style="color:#B26CDD;">{category_counts["resurrected"]}</div>
+      <div class="stat-detail">Returned after &gt;15 day gap</div>
+    </div>
+  </div>
+
+  {q5_at_risk_detail}
+  {q5_churned_detail}
+  {q5_resurrected_detail}
+
   <div class="method-note">
-    <strong>How this was measured:</strong> Users whose Mixpanel <code>$last_seen</code> timestamp is &gt;14 days before today.
-    This does not distinguish between app opens, sleep sessions, or passive events.<br><br>
+    <strong>How this was measured:</strong> Based on days since last completed sleep session (&gt;90 min).
+    <strong style="color:#D84516">At-Risk</strong> = 8&ndash;15 days.
+    <strong style="color:#8B5E3C">Churned</strong> = &gt;15 days.
+    <strong style="color:#B26CDD">Resurrected</strong> = had a &gt;15 day gap but completed a session in the last 7 days.<br><br>
     <strong>Limitation:</strong> This does not tell us whether a user has <em>returned the product</em>. Return/refund data
-    would need to come from Shopify or your CX system.
+    would need to come from Shopify or your CX system. A &ldquo;Returned&rdquo; category will be added once Shopify data is synced.
   </div>
 </div>
 
@@ -1100,7 +1323,7 @@ html = f"""<!DOCTYPE html>
   <h2>Full User Detail</h2>
   <details><summary>See all {q1_total} users</summary><div class="detail-content">
   <div class="table-wrap"><table>
-    <thead><tr><th>User</th><th>Activated</th><th>Sessions</th><th>Usage Rate</th><th>Avg SWS</th><th>Avg Boost</th><th>HealthKit</th><th>Last Seen</th><th>Status</th></tr></thead>
+    <thead><tr><th>User</th><th>Activated</th><th>Sessions</th><th>Usage Rate</th><th>Avg SWS</th><th>Avg Boost</th><th>HealthKit</th><th>Last Seen</th><th>Lifecycle</th></tr></thead>
     <tbody>{user_rows_html}</tbody>
   </table></div></div></details>
 </div>
